@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from tensorflow.python.kernel_tests.parsing_ops_test import feature
 from sklearn.model_selection import train_test_split
 from scipy.ndimage.measurements import label
+import _thread
 
 
 
@@ -188,11 +189,15 @@ class VehicleDetector(object):
         self.svc = None
         self.X_scaler = None
         self.colorSpace_Hist = cv2.COLOR_BGR2HSV
-        self.colorSpace_HOG = cv2.COLOR_BGR2LUV
+        self.colorSpace_HOG = cv2.COLOR_BGR2YCrCb #cv2.COLOR_BGR2LUV
         self.cells_per_block = 2
         self.px_per_cell = 8
         self.hog_orientation = 9
         self.sampleFileName = "img"
+        self.continuousHeatmap = []
+        self.heatMapHistory = 8
+        self.resultingCars = []
+        self.dumpView = False #make dumps of different pictures
         pass
     
     def trackAndVerify(self, cars, hist_cars):
@@ -224,11 +229,25 @@ class VehicleDetector(object):
         heatMap = np.zeros_like(im[:,:,0])
         for window in windows:
             heatMap[window[0][1]-window[1]:window[0][1]+window[1], window[0][0]-window[1]:window[0][0]+window[1]] += 1
-        heatMap[heatMap <= threshold] = 0
-        heatMap[heatMap > threshold ] = 255
-        labelsVec = label(heatMap)
+        self.continuousHeatmap.append(heatMap.astype(np.uint32))
+        
+        
+        if len(self.continuousHeatmap) < self.heatMapHistory:
+            return self.resultingCars
+        self.resultingCars = [] 
+        resultingHeatMap = sum(self.continuousHeatmap)
+        print (resultingHeatMap.dtype)
+        resultingHeatMap[resultingHeatMap <= np.uint32(self.heatMapHistory * threshold)] = 0
+#         resultingHeatMap[resultingHeatMap > 0] = threshold
+        self.continuousHeatmap = [resultingHeatMap]
+        
+#         heatMap[heatMap > threshold ] += 100
+        
+        if self.dumpView == True:
+            cv2.imshow("HeatMap", heatMap)
+            cv2.waitKey(0)
         #labelsVec contains the labels beginning from 1
-        resultingCars = []
+        labelsVec = label(resultingHeatMap)
         for labels in range(1, labelsVec[1]+1):
             #identify all pixels with a certain lable
             nonzero = (labelsVec[0] == labels).nonzero()
@@ -237,8 +256,8 @@ class VehicleDetector(object):
             nonzerox = np.array(nonzero[1])
             # Define a bounding box based on min/max x and y
             bbox = ((np.min(nonzerox), np.min(nonzeroy)), (np.max(nonzerox), np.max(nonzeroy)))
-            resultingCars.append(bbox)
-        return resultingCars
+            self.resultingCars.append(bbox)
+        return self.resultingCars
     
     #find potential car candidates in a frame using a certain scale in order
     #to apply different Window-sizes on the image
@@ -246,7 +265,7 @@ class VehicleDetector(object):
     #with (x,y center), square-length/2
     #Passing drawImage = True will show an image on screen with
     #possible detections
-    def findHotWindows(self, im, scale, drawImage = False):
+    def findHotWindows(self, im, scale, scaler, hogColorspace, histColorSpace, drawImage = False):
         searchScale_y = (400,640)
         px_per_cell = 8
         cell_per_block = 2
@@ -284,7 +303,7 @@ class VehicleDetector(object):
         
         
         #extract the hog-features
-        hogImage = cv2.cvtColor(searchImg, self.colorSpace_HOG)
+        hogImage = cv2.cvtColor(searchImg, hogColorspace)
         hog1 = self.getHOGFeatures(hogImage[:,:,0], orient, px_per_cell, cell_per_block, feature_vec=False)
         hog2 = self.getHOGFeatures(hogImage[:,:,1], orient, px_per_cell, cell_per_block, feature_vec=False)
         hog3 = self.getHOGFeatures(hogImage[:,:,2], orient, px_per_cell, cell_per_block, feature_vec=False)
@@ -305,12 +324,12 @@ class VehicleDetector(object):
                 #extract the sub-image for the current window and resize it to our sample size of
                 xleft = xpos * px_per_cell
                 ytop = ypos * px_per_cell
-                
-                cv2.rectangle(drawImg, (int(xleft*scale), int(ytop*scale)+searchScale_y[0]), (int((xleft+window)*scale), int((ytop+window)*scale)+searchScale_y[0]), (255,0,0), 1)
+                if drawImage:
+                    cv2.rectangle(drawImg, (int(xleft*scale), int(ytop*scale)+searchScale_y[0]), (int((xleft+window)*scale), int((ytop+window)*scale)+searchScale_y[0]), (255,0,0), 1)
                 subimg = cv2.resize(searchImg[ytop:ytop+window, xleft:xleft+window], (window, window))
                 #get the histogram features
                 #todo choose the best color space
-                hist_feature = self.getHistogramFeature(subimg, self.colorSpace_Hist)
+                hist_feature = self.getHistogramFeature(subimg, histColorSpace)
                 
                 featVec = [np.concatenate((hist_feature, hog_features))]
                 # Create an array stack, NOTE: StandardScaler() expects np.float64
@@ -492,9 +511,13 @@ class VehicleDetector(object):
         assert(not(self.svc is None))
         candidates = []
         #0.875
-        for scale in [0.5, 0.75, 1.0, 1.25, 1.5]:
-            candidates.extend(self.findHotWindows(image, scale))
-        resBounding = self.mergeHotWindows(image, candidates, 5)
+        try:
+            for scale in [0.5, 0.75, 1.0, 1.25, 1.5]:
+                _thread.start_new_thread(candidates.extend(self.findHotWindows(image, scale)), "ThreadScale {0:.2f}".format(scale))
+        except:
+            print ("Error creating thread")
+                
+        resBounding = self.mergeHotWindows(image, candidates, 4)
         for car in resBounding:
             cv2.rectangle(image, car[0], car[1],(0,0,255),6)
         return image  
@@ -505,8 +528,10 @@ class VehicleDetector(object):
         assert(not(self.svc is None))
         head, self.sampleFileName = os.path.split(pathToFile)
         img = cv2.imread(pathToFile)
-        print (np.max(img))
+        hist = self.heatMapHistory
+        self.heatMapHistory = 1
         self.processImage(img)
+        self.heatMapHistory = hist
         
         
 
@@ -521,7 +546,7 @@ class VehicleDetector(object):
     extractColorDistribution = staticmethod(extractColorDistribution)
 
 from moviepy.editor import VideoFileClip
-
+import time
 if __name__ == '__main__':
     persPath ="../persistency.bin"
 #     pathNonVehicles = "../training_data/Mika/non-vehicles"
@@ -533,17 +558,19 @@ if __name__ == '__main__':
     vehd.trainClassifier(pathVehicles, pathNonVehicles, True)
     vehd.store(persPath)
     
-    
-#     vehd.findCar("../test_images/test6.jpg")
+    vehd.dumpView = True
+    vehd.findCar("../misdetection2.png")
     
 #Video processing
 #     clip1 = VideoFileClip("../test_video.mp4")
+#     clip1 = VideoFileClip("../project_video.mp4")
 #     clipo = clip1.fl_image(lambda x: cv2.cvtColor(vehd.processImage(\
 #               cv2.cvtColor(x, cv2.COLOR_RGB2BGR) ), cv2.COLOR_BGR2RGB ))
-#     clipo.write_videofile("../result3.mp4", audio=False)
+# #     clipo.write_videofile("../result3.mp4", audio=False)
+#     clipo.write_videofile("../result.mp4", audio=False)
 #     
     
-    
+    time.sleep(5)
     exit(1)
     
     features = vehd.prepareTrainingData(pathVehicles, pathNonVehicles)
